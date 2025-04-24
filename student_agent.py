@@ -7,4 +7,5 @@ class Agent(object):
         self.action_space = gym.spaces.Discrete(12)
 
     def act(self, observation):
+        print(observation.shape)
         return self.action_space.sample()
