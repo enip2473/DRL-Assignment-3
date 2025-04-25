@@ -15,7 +15,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_STACKED_FRAMES = 4
 FRAME_HEIGHT = 84
 FRAME_WIDTH = 84
-TRAIN_ITER = 100
+TRAIN_ITER = 10000
 TRAIN_FREQ = 4
 SAVE_PATH = "model_weight.pth"
 
@@ -40,7 +40,7 @@ class MarioPreprocessor:
         self.output_width = output_size[1]
         self.cv2_output_size = (self.output_width, self.output_height)
         self.frame_buffer = deque(maxlen=NUM_STACKED_FRAMES)
-        initial_processed_frame = np.zeros((FRAME_HEIGHT, FRAME_WIDTH), dtype=np.float32) # Example
+        initial_processed_frame = np.zeros((FRAME_HEIGHT, FRAME_WIDTH), dtype=np.uint8) # Example
         for _ in range(NUM_STACKED_FRAMES):
             self.frame_buffer.append(initial_processed_frame)
 
@@ -78,15 +78,14 @@ class MarioPreprocessor:
             interpolation=cv2.INTER_AREA
         )
         # Result shape: (output_height, output_width)
-
+        self.frame_buffer.append(resized_frame)
         # 3. Normalize pixel values to [0, 1] and change dtype
         # Ensure the frame is float before division
-        normalized_frame = resized_frame.astype(np.float32) / 255.0
-
+        stacked_frames = np.stack(self.frame_buffer, axis=0) 
         # Add channel dimension if needed downstream (e.g., for PyTorch Conv2d expecting C, H, W)
         # Usually FrameStack handles the channel dimension, but if using single frames:
-        self.frame_buffer.append(normalized_frame)
-        return np.stack(self.frame_buffer, axis=0)
+        normalized_state = stacked_frames.astype(np.float32) / 255.0
+        return normalized_state
     
     def reset(self):
         initial_processed_frame = np.zeros((FRAME_HEIGHT, FRAME_WIDTH), dtype=np.float32) # Example
@@ -639,15 +638,16 @@ def main():
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
     agent = RainbowDQNAgent(input_shape=(NUM_STACKED_FRAMES, FRAME_WIDTH, FRAME_HEIGHT), n_actions=12, device=DEVICE)
     processor = MarioPreprocessor()
+    
     if os.path.exists(SAVE_PATH):
         agent.load_model(SAVE_PATH)
 
     for _ in tqdm.tqdm(range(TRAIN_ITER)):
         reward = run_one_episode(env, agent, processor)
         print("Reward: ", reward)
-        if _ % 100 == 0:
+        if (_ + 1) % 100 == 0:
             agent.save_model(f"tmp_{SAVE_PATH}")
-
+            
     agent.save_model(SAVE_PATH)
     
 
