@@ -1,13 +1,23 @@
 import random
 import tqdm
 import cv2
+import torch
+import os
 import numpy as np
 import gym_super_mario_bros
 from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
 from nes_py.wrappers import JoypadSpace
 from torch import nn
+import torch.optim as optim
+from collections import deque
 
-TRAIN_ITER = 10
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+NUM_STACKED_FRAMES = 4
+FRAME_HEIGHT = 84
+FRAME_WIDTH = 84
+TRAIN_ITER = 100
+TRAIN_FREQ = 4
+SAVE_PATH = "model_weight.pth"
 
 class MarioPreprocessor:
     """
@@ -28,8 +38,12 @@ class MarioPreprocessor:
         # but store internally maybe as (height, width) for clarity
         self.output_height = output_size[0]
         self.output_width = output_size[1]
-        # cv2 resize expects (width, height)
         self.cv2_output_size = (self.output_width, self.output_height)
+        self.frame_buffer = deque(maxlen=NUM_STACKED_FRAMES)
+        initial_processed_frame = np.zeros((FRAME_HEIGHT, FRAME_WIDTH), dtype=np.float32) # Example
+        for _ in range(NUM_STACKED_FRAMES):
+            self.frame_buffer.append(initial_processed_frame)
+
         print(f"Preprocessor initialized for output size: (Height: {self.output_height}, Width: {self.output_width})")
 
     def process(self, frame):
@@ -71,8 +85,13 @@ class MarioPreprocessor:
 
         # Add channel dimension if needed downstream (e.g., for PyTorch Conv2d expecting C, H, W)
         # Usually FrameStack handles the channel dimension, but if using single frames:
-        # normalized_frame = np.expand_dims(normalized_frame, axis=0) # Shape: (1, H, W)
-        return normalized_frame
+        self.frame_buffer.append(normalized_frame)
+        return np.stack(self.frame_buffer, axis=0)
+    
+    def reset(self):
+        initial_processed_frame = np.zeros((FRAME_HEIGHT, FRAME_WIDTH), dtype=np.float32) # Example
+        for _ in range(NUM_STACKED_FRAMES):
+            self.frame_buffer.append(initial_processed_frame)
 
 class SumTree:
     """
@@ -268,84 +287,369 @@ class PrioritizedReplayBuffer:
         """Returns the current number of items in the buffer."""
         return self.sum_tree.n_entries
 
-class DuelingQNet(nn.Module):
-    def __init__(self, n_states, n_actions):
-        super(DuelingQNet, self).__init__()
+class DuelingCNNQNet(nn.Module):
+    """
+    Dueling Q-Network with CNN feature extractor, suitable for image inputs.
+    """
+    def __init__(self, input_shape, n_actions):
+        """
+        Args:
+            input_shape (tuple): Shape of the preprocessed input state
+                                 (e.g., (4, 84, 84) for 4 stacked 84x84 frames).
+            n_actions (int): Number of possible actions.
+        """
+        super(DuelingCNNQNet, self).__init__()
+        self.input_shape = input_shape
         self.n_actions = n_actions
 
-        # Shared feature layers (first part of the original network)
-        self.feature_layer = nn.Sequential(
-            nn.Linear(n_states, 64),
+        # --- Convolutional Feature Extractor ---
+        # Takes input shape (Channels, Height, Width), e.g., (4, 84, 84)
+        self.conv_layers = nn.Sequential(
+            # Conv1: Input (4, 84, 84) -> Output (32, 20, 20)
+            nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4),
             nn.ReLU(),
-            nn.Linear(64, 64),
+            # Conv2: Input (32, 20, 20) -> Output (64, 9, 9)
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            # Conv3: Input (64, 9, 9) -> Output (64, 7, 7)
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
             nn.ReLU()
-            # Output of this layer has size 64
+            # Output features have shape (BatchSize, 64, 7, 7)
         )
 
-        # Value stream head - estimates V(s)
-        # Takes the 64 features and processes them further
+        # --- Calculate flattened size ---
+        # We need to know the output size of conv_layers to define the Linear layers
+        conv_out_size = self._get_conv_output_size(input_shape)
+
+        # --- Dueling Heads ---
+
+        # Value Stream Head - estimates V(s)
         self.value_stream = nn.Sequential(
-            nn.Linear(64, 64), # Continues from the shared 64 features
+            nn.Linear(conv_out_size, 512), # Takes flattened features
             nn.ReLU(),
-            nn.Linear(64, 1)   # Outputs a single scalar value V(s)
+            nn.Linear(512, 1)              # Outputs a single scalar value V(s)
         )
 
-        # Advantage stream head - estimates A(s, a) for each action
-        # Also takes the 64 features
+        # Advantage Stream Head - estimates A(s, a) for each action
         self.advantage_stream = nn.Sequential(
-            nn.Linear(64, 64), # Continues from the shared 64 features
+            nn.Linear(conv_out_size, 512), # Takes flattened features
             nn.ReLU(),
-            nn.Linear(64, n_actions) # Outputs one advantage value per action A(s,a)
+            nn.Linear(512, n_actions)      # Outputs one advantage value per action A(s,a)
         )
+
+    def _get_conv_output_size(self, shape):
+        """
+        Calculates the output size of the convolutional layers by performing
+        a dummy forward pass.
+        """
+        # Create a dummy tensor with the expected input shape (adding batch dim)
+        dummy_input = torch.zeros(1, *shape)
+        # Pass it through the convolutional layers
+        output = self.conv_layers(dummy_input)
+        # Calculate the total number of features after flattening
+        return int(np.prod(output.size()))
 
     def forward(self, x):
-        # Pass input through the shared feature layers
-        features = self.feature_layer(x) # Shape: (batch_size, 64)
+        """
+        Forward pass through the network.
+        Args:
+            x (torch.Tensor): Input tensor (preprocessed states).
+                              Shape: (batch_size, C, H, W), e.g., (32, 4, 84, 84).
+                              Ensure pixel values are normalized (e.g., scaled to [0, 1]).
+        Returns:
+            torch.Tensor: Q-values for each action. Shape: (batch_size, n_actions).
+        """
+        # Normalize input if not already done (e.g., assuming input is 0-255)
+        # It's often better to do this in preprocessing/data loading
+        # x = x / 255.0
+
+        # Pass input through the convolutional feature extractor
+        conv_features = self.conv_layers(x) # Shape: (batch_size, 64, 7, 7)
+
+        # Flatten the features for the fully connected layers
+        # Shape becomes (batch_size, 64 * 7 * 7) = (batch_size, 3136)
+        flattened_features = conv_features.view(conv_features.size(0), -1)
 
         # Calculate Value and Advantage streams
-        value = self.value_stream(features)           # Shape: (batch_size, 1)
-        advantages = self.advantage_stream(features)   # Shape: (batch_size, n_actions)
+        value = self.value_stream(flattened_features)      # Shape: (batch_size, 1)
+        advantages = self.advantage_stream(flattened_features) # Shape: (batch_size, n_actions)
 
-        # Combine Value and Advantage streams to get Q-values
+        # Combine Value and Advantage streams using the Dueling formula
         # Q(s,a) = V(s) + (A(s,a) - mean(A(s,a')))
-        # Subtracting the mean advantage is crucial for identifiability and stability
         q_values = value + (advantages - advantages.mean(dim=1, keepdim=True))
-        # value has shape (batch, 1), advantages has shape (batch, n_actions)
-        # advantages.mean(dim=1, keepdim=True) has shape (batch, 1)
-        # Broadcasting correctly combines them to shape (batch, n_actions)
 
         return q_values
 
 class RainbowDQNAgent:
-    def __init__(self, env):
-        self.action_space = env.action_space
+    """
+    DQN Agent integrating Dueling architecture, Double DQN, and Prioritized Experience Replay.
+    Designed for image-based environments like Super Mario Bros.
+    Note: This is a partial Rainbow implementation (missing N-step, C51, Noisy Nets).
+    """
+    def __init__(self,
+                 input_shape,          # Shape of preprocessed state (e.g., (4, 84, 84))
+                 n_actions,            # Number of possible actions
+                 device,               # Device to run on ('cpu' or 'cuda')
+                 lr=1e-4,              # Learning rate
+                 gamma=0.99,           # Discount factor
+                 buffer_capacity=100000,# Replay buffer capacity
+                 batch_size=32,        # Training batch size
+                 target_update_freq=1000,# How often to update target network (in steps)
+                 epsilon_start=1.0,    # Initial exploration rate
+                 epsilon_min=0.01,     # Minimum exploration rate
+                 epsilon_decay=0.9999): # Epsilon decay factor per step/call
 
-    def select_action(self, state):
-        print(state.shape)
-        return self.action_space.sample()
+        self.input_shape = input_shape
+        self.n_actions = n_actions
+        self.device = device
+        self.gamma = gamma
+        self.batch_size = batch_size
+        self.target_update_freq = target_update_freq
+        self.epsilon = epsilon_start
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_decay
+        self.total_steps = 0 # Counter for steps taken
+
+        print(f"Initializing Agent on device: {self.device}")
+        print(f"Input shape: {input_shape}, Actions: {n_actions}")
+
+        # --- Networks ---
+        print("Creating Q-Network and Target Network...")
+        self.q_net = DuelingCNNQNet(input_shape, n_actions).to(self.device)
+        self.target_net = DuelingCNNQNet(input_shape, n_actions).to(self.device)
+        # Synchronize target network initially
+        self.target_net.load_state_dict(self.q_net.state_dict())
+        self.target_net.eval() # Target network is only for inference
+        print("Networks created and target network synchronized.")
+
+        # --- Optimizer ---
+        self.optimizer = optim.Adam(self.q_net.parameters(), lr=lr)
+        print(f"Optimizer Adam initialized with lr={lr}")
+
+        # --- Replay Buffer ---
+        print(f"Initializing Prioritized Replay Buffer with capacity {buffer_capacity}...")
+        self.replay_buffer = PrioritizedReplayBuffer(capacity=buffer_capacity)
+        print("Replay Buffer initialized.")
+        # --- Loss Function ---
+        # Using MSE Loss here, but SmoothL1Loss is also common
+        # We'll apply IS weights manually
+        self.loss_fn = nn.MSELoss(reduction='none') # Calculate element-wise loss
+
+
+    def select_action(self, state, use_epsilon=True):
+        """
+        Selects an action using epsilon-greedy strategy.
+
+        Args:
+            state (np.ndarray): The *preprocessed* input state (e.g., shape (4, 84, 84)).
+            use_epsilon (bool): Whether to apply epsilon-greedy exploration.
+
+        Returns:
+            int: The selected action index.
+        """
+        # Epsilon-greedy exploration
+        if use_epsilon and random.random() <= self.epsilon:
+            return random.randrange(self.n_actions)
+        else:
+            # Convert state to tensor, add batch dimension, send to device
+            # Ensure state is float32
+            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+
+            # Get Q-values from the main network
+            self.q_net.eval() # Set to evaluation mode for inference
+            with torch.no_grad():
+                q_values = self.q_net(state_tensor)
+            self.q_net.train() # Set back to training mode
+
+            # Select action with the highest Q-value
+            action = torch.argmax(q_values).item()
+            return action
+
+    def store_experience(self, state, action, reward, next_state, done):
+        """
+        Stores an experience tuple in the replay buffer.
+        Assumes states are already preprocessed.
+
+        Args:
+            state (np.ndarray): Preprocessed current state.
+            action (int): Action taken.
+            reward (float): Reward received.
+            next_state (np.ndarray): Preprocessed next state.
+            done (bool): Whether the episode terminated.
+        """
+        # Add experience to PER buffer with max priority initially
+        self.replay_buffer.add(state, action, reward, next_state, done)
+
+    def _update_target_network(self):
+        """Copies weights from the main Q-network to the target network."""
+        print(f"\n--- Step {self.total_steps}: Updating target network ---")
+        self.target_net.load_state_dict(self.q_net.state_dict())
+
+    def _compute_td_error_and_loss(self, batch_data, indices, is_weights):
+        """
+        Computes the TD errors and the weighted loss for a batch using Double DQN.
+
+        Args:
+            batch_data (dict): Dictionary containing 'states', 'actions', etc. as np.arrays.
+            indices (list): List of tree indices for the sampled transitions.
+            is_weights (np.ndarray): Importance sampling weights for the batch.
+
+        Returns:
+            tuple: (loss (torch.Tensor), td_errors (np.ndarray))
+        """
+        # Convert numpy arrays from batch_data to tensors on the correct device
+        states = torch.tensor(batch_data['states'], dtype=torch.float32).to(self.device)
+        actions = torch.tensor(batch_data['actions'], dtype=torch.int64).unsqueeze(1).to(self.device) # Shape: (batch, 1)
+        rewards = torch.tensor(batch_data['rewards'], dtype=torch.float32).unsqueeze(1).to(self.device) # Shape: (batch, 1)
+        next_states = torch.tensor(batch_data['next_states'], dtype=torch.float32).to(self.device)
+        dones = torch.tensor(batch_data['dones'], dtype=torch.float32).unsqueeze(1).to(self.device) # Shape: (batch, 1)
+        is_weights_tensor = torch.tensor(is_weights, dtype=torch.float32).unsqueeze(1).to(self.device) # Shape: (batch, 1)
+
+        # --- Double DQN Logic ---
+        # 1. Get Q-values for next states from the main network
+        self.q_net.eval() # Use eval mode for action selection consistency
+        with torch.no_grad():
+             q_values_next_main = self.q_net(next_states)
+        self.q_net.train() # Back to train mode
+
+        # 2. Select the best actions for next states using the main network's Q-values
+        # Shape: (batch, 1)
+        best_actions_next = torch.argmax(q_values_next_main, dim=1, keepdim=True)
+
+        # 3. Evaluate these selected actions using the target network
+        # Shape: (batch, 1)
+        with torch.no_grad():
+            q_values_next_target = self.target_net(next_states).gather(1, best_actions_next)
+        # --- End Double DQN ---
+
+        # Calculate TD Target
+        # target = r + gamma * Q_target(s', argmax_a' Q_main(s', a')) * (1 - done)
+        td_target = rewards + self.gamma * q_values_next_target * (1 - dones)
+
+        # Get Q-values for the current states and actions taken (from main network)
+        # Shape: (batch, 1)
+        current_q_values = self.q_net(states).gather(1, actions)
+
+        # Calculate element-wise loss (e.g., MSE or Smooth L1)
+        elementwise_loss = self.loss_fn(current_q_values, td_target)
+
+        # Apply Importance Sampling weights
+        weighted_loss = elementwise_loss * is_weights_tensor
+
+        # Calculate the final loss (mean over the batch)
+        loss = weighted_loss.mean()
+
+        # Calculate TD errors (absolute difference) for priority updates
+        # Use .detach() to prevent gradients from flowing back from this calculation
+        td_errors = (td_target - current_q_values).abs().detach().cpu().numpy().flatten()
+
+        return loss, td_errors
+
+    def train(self):
+        """
+        Samples a batch from the replay buffer, computes loss, performs backprop,
+        updates network weights, and updates priorities in the buffer.
+        Also handles periodic target network updates.
+        """
+        # Only train if buffer has enough samples and meets batch size requirement
+        if len(self.replay_buffer) < self.batch_size:
+            # print(f"Skipping training step {self.total_steps}. Buffer size {len(self.replay_buffer)} < Batch size {self.batch_size}")
+            return # Not enough samples yet
+
+        # Sample batch from PER buffer
+        batch_data, indices, is_weights = self.replay_buffer.sample(self.batch_size)
+
+        if not batch_data: # Handle case where sampling might fail (e.g., empty buffer)
+             print("Warning: Sampled empty batch. Skipping training step.")
+             return
+
+        # Compute loss and TD errors
+        loss, td_errors = self._compute_td_error_and_loss(batch_data, indices, is_weights)
+
+        # --- Gradient Descent ---
+        self.optimizer.zero_grad()
+        loss.backward()
+        # Optional: Gradient Clipping
+        # torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)
+        self.optimizer.step()
+        # --- End Gradient Descent ---
+
+        # Update priorities in the replay buffer
+        self.replay_buffer.update_priorities(indices, td_errors)
+
+        # Increment step counter (used for target updates and epsilon decay)
+        self.total_steps += 1
+
+        # --- Periodic Target Network Update ---
+        if self.total_steps % self.target_update_freq == 0:
+            self._update_target_network()
+
+        # --- Epsilon Decay ---
+        # Decay epsilon after each training step or episode end (choose one)
+        # Decaying per step is common in large-scale experiments
+        self.decay_epsilon()
+
+        # Return loss value for logging if needed
+        return loss.item()
+
+
+    def decay_epsilon(self):
+        """Decays the exploration rate epsilon."""
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+    def save_model(self, path):
+        """Saves the Q-network weights."""
+        print(f"\nSaving model Q-network state_dict to {path}...")
+        torch.save(self.q_net.state_dict(), path)
+        print("Model saved.")
+
+    def load_model(self, path):
+        """Loads the Q-network weights."""
+        print(f"\nLoading model Q-network state_dict from {path}...")
+        self.q_net.load_state_dict(torch.load(path, map_location=self.device))
+        # Also update target network to match loaded weights
+        self._update_target_network()
+        self.q_net.train() # Ensure model is in train mode after loading
+        self.target_net.eval() # Ensure target is in eval mode
+        print("Model loaded and target network synchronized.")
 
 def run_one_episode(env: JoypadSpace, agent: RainbowDQNAgent, processor: MarioPreprocessor):
     state = env.reset()
+    processor.reset()
+
     done = False
     total_reward = 0
-    
+    total_steps = 0
+    processed_state = processor.process(state)
     while not done:
-        processed_state = processor.process(state)
         action = agent.select_action(processed_state)
-        state, reward, done, info = env.step(action)
+        next_state, reward, done, info = env.step(action)
+        processed_next_state = processor.process(next_state)
+        agent.store_experience(processed_state, action, reward, processed_next_state, done)
+        processed_state = processed_next_state
         total_reward += reward
+        total_steps += 1
+        if total_steps % TRAIN_FREQ == 0:
+            agent.train()
     
     return total_reward
 
 def main():
     env = gym_super_mario_bros.make('SuperMarioBros-v0')
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
-    agent = RainbowDQNAgent(env=env)
+    agent = RainbowDQNAgent(input_shape=(NUM_STACKED_FRAMES, FRAME_WIDTH, FRAME_HEIGHT), n_actions=12, device=DEVICE)
     processor = MarioPreprocessor()
-    
+    if os.path.exists(SAVE_PATH):
+        agent.load_model(SAVE_PATH)
+
     for _ in tqdm.tqdm(range(TRAIN_ITER)):
         reward = run_one_episode(env, agent, processor)
         print("Reward: ", reward)
+        if _ % 100 == 0:
+            agent.save_model(f"tmp_{SAVE_PATH}")
+
+    agent.save_model(SAVE_PATH)
+    
 
 if __name__ == "__main__":
     main()
