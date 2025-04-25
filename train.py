@@ -88,7 +88,7 @@ class MarioPreprocessor:
         return normalized_state
     
     def reset(self):
-        initial_processed_frame = np.zeros((FRAME_HEIGHT, FRAME_WIDTH), dtype=np.float32) # Example
+        initial_processed_frame = np.zeros((FRAME_HEIGHT, FRAME_WIDTH), dtype=np.uint8) # Example
         for _ in range(NUM_STACKED_FRAMES):
             self.frame_buffer.append(initial_processed_frame)
 
@@ -391,7 +391,7 @@ class RainbowDQNAgent:
                  device,               # Device to run on ('cpu' or 'cuda')
                  lr=1e-4,              # Learning rate
                  gamma=0.99,           # Discount factor
-                 buffer_capacity=100000,# Replay buffer capacity
+                 buffer_capacity=10000,# Replay buffer capacity
                  batch_size=32,        # Training batch size
                  target_update_freq=1000,# How often to update target network (in steps)
                  epsilon_start=1.0,    # Initial exploration rate
