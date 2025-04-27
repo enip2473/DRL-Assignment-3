@@ -4,6 +4,7 @@ import cv2
 import torch
 import os
 import numpy as np
+import gym
 import gym_super_mario_bros
 from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
 from nes_py.wrappers import JoypadSpace
@@ -17,6 +18,7 @@ FRAME_HEIGHT = 84
 FRAME_WIDTH = 84
 TRAIN_ITER = 10000
 TRAIN_FREQ = 4
+SKIP = 4
 SAVE_PATH = "model_weight.pth"
 
 class MarioPreprocessor:
@@ -92,199 +94,168 @@ class MarioPreprocessor:
         for _ in range(NUM_STACKED_FRAMES):
             self.frame_buffer.append(initial_processed_frame)
 
-class SumTree:
+class MemoryEfficientPERBuffer:
     """
-    A binary tree data structure where the value of a parent node
-    is the sum of its children. Leaf nodes store priorities, and
-    internal nodes store sums. Allows O(log N) operations for
-    sampling and updates.
+    A Prioritized Experience Replay buffer optimized for memory efficiency.
+
+    - Stores states as uint8 (0-255) to save memory.
+    - Uses direct probability calculation for sampling (O(N) complexity).
+    - Avoids the SumTree structure.
     """
-    def __init__(self, capacity):
-        # Tree structure: Stores priorities and sums. Size is 2*capacity - 1.
-        # Index 0 is the root. Leaves start at index capacity - 1.
+    def __init__(self, capacity, input_shape=(4, 84, 84), alpha=0.6, beta_start=0.4, beta_frames=100000):
         self.capacity = capacity
-        self.tree = np.zeros(2 * capacity - 1)
-        # Data storage: Stores the actual experience tuples.
-        self.data = np.zeros(capacity, dtype=object)
-        self.data_pointer = 0 # Points to the next empty spot in self.data
-        self.n_entries = 0 # Current number of entries in the buffer
+        self.input_shape = input_shape # e.g., (4, 84, 84)
+        self.alpha = alpha # Prioritization exponent
+        self.beta_start = beta_start # Initial IS exponent
+        self.beta = beta_start
+        self.beta_increment = (1.0 - beta_start) / beta_frames
+        self.eps = 1e-6 # Small constant for priority calculation
+        self.max_priority = 1.0 # Initial priority for new experiences
 
-    def _propagate(self, idx, change):
-        """Propagates a change in priority up the tree."""
-        parent = (idx - 1) // 2
-        self.tree[parent] += change
-        if parent != 0: # If not root
-            self._propagate(parent, change)
+        # --- Data Storage ---
+        # Store states compressed as uint8
+        self.states = np.zeros((capacity, *input_shape), dtype=np.uint8)
+        self.next_states = np.zeros((capacity, *input_shape), dtype=np.uint8)
+        # Store other components
+        self.actions = np.zeros(capacity, dtype=np.int64)
+        self.rewards = np.zeros(capacity, dtype=np.float32)
+        self.dones = np.zeros(capacity, dtype=np.bool_)
+        # Store priorities directly
+        self.priorities = np.zeros(capacity, dtype=np.float64) # Use float64 for precision
 
-    def _retrieve(self, idx, s):
-        """Finds the sample index for a given priority value 's'."""
-        left = 2 * idx + 1
-        right = left + 1
+        # --- Pointers and Counters ---
+        self.data_pointer = 0
+        self.n_entries = 0 # Current number of items in buffer
 
-        if left >= len(self.tree): # Reached leaf node
-            return idx
+        print(f"MemoryEfficientPERBuffer initialized with capacity {capacity}.")
+        # Estimate memory usage (rough estimate)
+        state_mem_mb = self.states.nbytes / (1024**2)
+        priority_mem_mb = self.priorities.nbytes / (1024**2)
+        other_mem_mb = (self.actions.nbytes + self.rewards.nbytes + self.dones.nbytes) / (1024**2)
+        print(f"Estimated memory: States ~{state_mem_mb*2:.2f} MB, Priorities ~{priority_mem_mb:.2f} MB, Others ~{other_mem_mb:.2f} MB")
 
-        if s <= self.tree[left]:
-            return self._retrieve(left, s)
-        else:
-            return self._retrieve(right, s - self.tree[left])
 
-    def total(self):
-        """Returns the total priority sum (value of the root node)."""
-        return self.tree[0]
+    def _compress_state(self, state_float32):
+        """ Converts normalized float32 state [0, 1] to uint8 [0, 255]. """
+        # Ensure input is within [0, 1] before scaling
+        state_clipped = np.clip(state_float32, 0.0, 1.0)
+        state_uint8 = (state_clipped * 255.0).astype(np.uint8)
+        return state_uint8
 
-    def add(self, priority, data):
-        """Adds a new experience with a given priority."""
-        # Calculate the tree index for the new data point
-        tree_idx = self.data_pointer + self.capacity - 1
-
-        # Store the data
-        self.data[self.data_pointer] = data
-
-        # Update the priority in the tree
-        self.update(tree_idx, priority)
-
-        # Advance the data pointer (cyclical)
-        self.data_pointer = (self.data_pointer + 1) % self.capacity
-
-        # Update the count of entries, capped at capacity
-        if self.n_entries < self.capacity:
-            self.n_entries += 1
-
-    def update(self, tree_idx, priority):
-        """Updates the priority of a node and propagates the change."""
-        if not (self.capacity - 1 <= tree_idx < 2 * self.capacity - 1):
-             raise IndexError(f"tree_idx {tree_idx} out of bounds for leaves [{self.capacity - 1}, {2 * self.capacity - 1})")
-
-        change = priority - self.tree[tree_idx]
-        self.tree[tree_idx] = priority
-        # Propagate the change upwards
-        self._propagate(tree_idx, change)
-
-    def get(self, s):
-        """
-        Gets the leaf index, priority, and data for a given sampled
-        priority value 's'.
-        """
-        idx = self._retrieve(0, s) # Get tree index of the leaf
-        data_idx = idx - self.capacity + 1 # Convert tree index to data index
-        return (idx, self.tree[idx], self.data[data_idx])
-
-    def __len__(self):
-        return self.n_entries
-
-class PrioritizedReplayBuffer:
-    def __init__(self, capacity, alpha=0.6, beta_start=0.4, beta_frames=100000):
-        self.sum_tree = SumTree(capacity)
-        self.capacity = capacity
-        self.alpha = alpha # Controls prioritization level (0=uniform, 1=full)
-        self.beta_start = beta_start # Initial IS weight exponent
-        self.beta = beta_start # Current IS weight exponent (annealed externally)
-        self.beta_increment_per_sampling = (1.0 - beta_start) / beta_frames
-        self.eps = 1e-6  # Small value added to priorities to ensure non-zero probability
-        self.max_priority = 1.0 # Initial max priority for new samples
+    def _decompress_state(self, state_uint8):
+        """ Converts uint8 state [0, 255] back to normalized float32 [0, 1]. """
+        return state_uint8.astype(np.float32) / 255.0
 
     def _get_priority(self, error):
-        """Converts TD error to priority."""
-        # P = (|error| + eps) ^ alpha
+        """ Converts TD error to priority using alpha. """
         return (np.abs(error) + self.eps) ** self.alpha
 
     def add(self, state, action, reward, next_state, done):
         """
-        Adds a new experience to the buffer with maximum priority initially.
-        Assigning max priority ensures new experiences are likely to be sampled soon.
+        Adds an experience, compressing states to uint8.
+        Assumes input states are normalized float32.
         """
-        # Store experience in SumTree with current max priority
-        priority = self.max_priority
-        self.sum_tree.add(priority, (state, action, reward, next_state, done))
+        # Compress states before storing
+        state_compressed = self._compress_state(state)
+        next_state_compressed = self._compress_state(next_state)
+
+        # Store data at the current pointer position
+        self.states[self.data_pointer] = state_compressed
+        self.actions[self.data_pointer] = action
+        self.rewards[self.data_pointer] = reward
+        self.next_states[self.data_pointer] = next_state_compressed
+        self.dones[self.data_pointer] = done
+        # Set initial priority to max
+        self.priorities[self.data_pointer] = self.max_priority
+
+        # Advance pointer and update entry count
+        self.data_pointer = (self.data_pointer + 1) % self.capacity
+        if self.n_entries < self.capacity:
+            self.n_entries += 1
 
     def sample(self, batch_size):
         """
-        Samples a batch of experiences based on priorities and calculates
-        Importance Sampling (IS) weights.
+        Samples a batch using priority probabilities and calculates IS weights.
+        Decompresses states before returning. O(N) complexity.
         """
-        batch = []
-        idxs = [] # Store tree indices
-        segment = self.sum_tree.total() / batch_size
-        priorities = []
+        if self.n_entries < batch_size:
+            # Not enough entries to sample a full batch
+            return {}, [], [] # Return empty dict, indices, weights
 
-        # Anneal beta
-        self.beta = np.min([1., self.beta + self.beta_increment_per_sampling])
+        # Get priorities of currently stored experiences
+        current_priorities = self.priorities[:self.n_entries]
 
-        if len(self) == 0: # Check if buffer is empty
-             return [], [], [] # Return empty lists if no samples
+        # Calculate sampling probabilities: P(i) = p_i^alpha / sum(p_j^alpha)
+        # Note: We use p_i directly here, as alpha is applied in _get_priority
+        #       and stored in self.priorities (implicitly, as p = (|err|+eps)^a).
+        #       So, we just need to normalize the stored priorities.
+        priority_sum = np.sum(current_priorities)
 
-        for i in range(batch_size):
-            # Sample a value from each segment
-            a = segment * i
-            b = segment * (i + 1)
-            s = random.uniform(a, b)
-
-            # Retrieve data associated with the sampled value
-            (idx, p, data) = self.sum_tree.get(s)
-
-            if data == 0: # Check if data is placeholder (can happen if buffer not full)
-                 # Resample if we hit an empty spot (should be rare with proper n_entries logic)
-                 # This indicates an issue, maybe buffer isn't filling correctly or total() is wrong
-                 print(f"Warning: Sampled empty data slot at tree_idx {idx}. Resampling.")
-                 # Simple fix: retry sampling (could be inefficient)
-                 # A better fix might involve checking n_entries vs capacity
-                 s_retry = random.uniform(0, self.sum_tree.total())
-                 (idx, p, data) = self.sum_tree.get(s_retry)
-                 if data == 0:
-                     print(f"Error: Failed to sample valid data even after retry.")
-                     # Handle error appropriately, maybe return smaller batch or raise exception
-                     continue # Skip this sample
-
-
-            priorities.append(p)
-            batch.append(data)
-            idxs.append(idx)
-
-        # Calculate sampling probabilities P(i) = p_i / total_priority
-        sampling_probabilities = np.array(priorities) / self.sum_tree.total()
-
-        # Calculate Importance Sampling (IS) weights w_i = (N * P(i)) ^ (-beta) / max(w)
-        # Use self.sum_tree.n_entries for N (current number of items)
-        is_weights = np.power(self.sum_tree.n_entries * sampling_probabilities, -self.beta)
-
-        # Normalize weights by dividing by the maximum weight for stability
-        if is_weights.size > 0: # Avoid division by zero if batch is empty
-             is_weights /= is_weights.max()
+        if priority_sum <= 0:
+            # Avoid division by zero if all priorities are zero (should be rare with eps)
+            # Fallback to uniform sampling among valid entries
+            print("Priority sum is zero or negative. Falling back to uniform sampling.")
+            probabilities = np.ones(self.n_entries) / self.n_entries
         else:
-             is_weights = np.array([])
+            probabilities = current_priorities / priority_sum
 
+        # Sample indices based on calculated probabilities
+        # Ensure probabilities sum to 1 (can have minor floating point issues)
+        probabilities = probabilities / probabilities.sum()
+        sampled_indices = np.random.choice(
+            self.n_entries, size=batch_size, replace=True, p=probabilities
+        )
 
-        # Unzip batch
-        states, actions, rewards, next_states, dones = zip(*batch)
+        # --- Importance Sampling Weights ---
+        # Anneal beta
+        self.beta = min(1.0, self.beta + self.beta_increment)
+        # Calculate IS weights: w_i = (N * P(i)) ^ (-beta)
+        weights = np.power(self.n_entries * probabilities[sampled_indices], -self.beta)
+        # Normalize weights by max(w) for stability
+        weights /= weights.max()
+
+        # --- Retrieve Batch Data ---
+        batch_states_compressed = self.states[sampled_indices]
+        batch_actions = self.actions[sampled_indices]
+        batch_rewards = self.rewards[sampled_indices]
+        batch_next_states_compressed = self.next_states[sampled_indices]
+        batch_dones = self.dones[sampled_indices]
+
+        # --- Decompress States ---
+        batch_states = np.array([self._decompress_state(s) for s in batch_states_compressed])
+        batch_next_states = np.array([self._decompress_state(ns) for ns in batch_next_states_compressed])
+
         batch_data = {
-            "states": np.array(states, dtype=np.float32),
-            "actions": np.array(actions, dtype=np.int64),
-            "rewards": np.array(rewards, dtype=np.float32),
-            "next_states": np.array(next_states, dtype=np.float32),
-            "dones": np.array(dones, dtype=np.float32) # Ensure float for later math
+            "states": batch_states,
+            "actions": batch_actions,
+            "rewards": batch_rewards,
+            "next_states": batch_next_states,
+            "dones": batch_dones # Already boolean
         }
 
-        return batch_data, idxs, is_weights # Return batch, tree indices, and IS weights
+        # Return batch, original buffer indices, and IS weights
+        return batch_data, sampled_indices, weights
 
-    def update_priorities(self, tree_indices, errors):
-        """
-        Updates the priorities of the sampled experiences based on their TD errors.
-        """
-        if len(tree_indices) != len(errors):
-            raise ValueError("Number of indices and errors must match.")
+    def update_priorities(self, indices, errors):
+        """ Updates priorities for the given indices based on TD errors. """
+        if len(indices) != len(errors):
+             print(f"Mismatch indices ({len(indices)}) vs errors ({len(errors)}). Skipping priority update.")
+             return
 
-        for idx, error in zip(tree_indices, errors):
-            # Calculate new priority based on error
-            priority = self._get_priority(error)
-            # Update the priority in the SumTree
-            self.sum_tree.update(idx, priority)
-            # Update the maximum priority observed so far
-            self.max_priority = max(self.max_priority, priority)
+        for idx, error in zip(indices, errors):
+            # Ensure index is valid
+            if idx < self.n_entries:
+                priority = self._get_priority(error)
+                self.priorities[idx] = priority
+                self.max_priority = max(self.max_priority, priority)
+            else:
+                print(f"Attempted to update priority for invalid index {idx} (n_entries={self.n_entries}).")
+
 
     def __len__(self):
-        """Returns the current number of items in the buffer."""
-        return self.sum_tree.n_entries
+        """ Returns the current number of items in the buffer. """
+        return self.n_entries
+
 
 class DuelingCNNQNet(nn.Module):
     """
@@ -391,7 +362,7 @@ class RainbowDQNAgent:
                  device,               # Device to run on ('cpu' or 'cuda')
                  lr=1e-4,              # Learning rate
                  gamma=0.99,           # Discount factor
-                 buffer_capacity=10000,# Replay buffer capacity
+                 buffer_capacity=50000,# Replay buffer capacity
                  batch_size=32,        # Training batch size
                  target_update_freq=1000,# How often to update target network (in steps)
                  epsilon_start=1.0,    # Initial exploration rate
@@ -425,9 +396,7 @@ class RainbowDQNAgent:
         self.optimizer = optim.Adam(self.q_net.parameters(), lr=lr)
         print(f"Optimizer Adam initialized with lr={lr}")
 
-        # --- Replay Buffer ---
-        print(f"Initializing Prioritized Replay Buffer with capacity {buffer_capacity}...")
-        self.replay_buffer = PrioritizedReplayBuffer(capacity=buffer_capacity)
+        self.replay_buffer = MemoryEfficientPERBuffer(capacity=buffer_capacity)
         print("Replay Buffer initialized.")
         # --- Loss Function ---
         # Using MSE Loss here, but SmoothL1Loss is also common
@@ -582,13 +551,8 @@ class RainbowDQNAgent:
         # --- Periodic Target Network Update ---
         if self.total_steps % self.target_update_freq == 0:
             self._update_target_network()
-
-        # --- Epsilon Decay ---
-        # Decay epsilon after each training step or episode end (choose one)
-        # Decaying per step is common in large-scale experiments
         self.decay_epsilon()
 
-        # Return loss value for logging if needed
         return loss.item()
 
 
@@ -612,7 +576,22 @@ class RainbowDQNAgent:
         self.target_net.eval() # Ensure target is in eval mode
         print("Model loaded and target network synchronized.")
 
-def run_one_episode(env: JoypadSpace, agent: RainbowDQNAgent, processor: MarioPreprocessor):
+class SkipFrame(gym.Wrapper):
+    def __init__(self, env, skip):
+        super().__init__(env)
+        self._skip = skip
+    
+    def step(self, action):
+        total_reward = 0
+        done = False
+        for _ in range(self._skip):
+            obs, reward, done, info = self.env.step(action)
+            total_reward += reward
+            if done: 
+                break
+        return obs, total_reward, done, info
+
+def run_one_episode(env: JoypadSpace, agent: RainbowDQNAgent, processor: MarioPreprocessor, is_training=True):
     state = env.reset()
     processor.reset()
 
@@ -620,33 +599,48 @@ def run_one_episode(env: JoypadSpace, agent: RainbowDQNAgent, processor: MarioPr
     total_reward = 0
     total_steps = 0
     processed_state = processor.process(state)
+
     while not done:
-        action = agent.select_action(processed_state)
+        action = agent.select_action(processed_state, use_epsilon=is_training)
         next_state, reward, done, info = env.step(action)
         processed_next_state = processor.process(next_state)
         agent.store_experience(processed_state, action, reward, processed_next_state, done)
         processed_state = processed_next_state
         total_reward += reward
         total_steps += 1
-        if total_steps % TRAIN_FREQ == 0:
+        if total_steps % TRAIN_FREQ == 0 and is_training:
             agent.train()
     
     return total_reward
 
+def pre_eval(env, agent, processor, iter=10):
+    total_reward = 0
+    for _ in range(iter):
+        total_reward += run_one_episode(env, agent, processor, is_training=False)
+    average_reward = total_reward / iter
+    print("Pre Eval Reward: ", average_reward)
+    return average_reward
+
 def main():
     env = gym_super_mario_bros.make('SuperMarioBros-v0')
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
+    env = SkipFrame(env, SKIP)
     agent = RainbowDQNAgent(input_shape=(NUM_STACKED_FRAMES, FRAME_WIDTH, FRAME_HEIGHT), n_actions=12, device=DEVICE)
     processor = MarioPreprocessor()
     
     if os.path.exists(SAVE_PATH):
         agent.load_model(SAVE_PATH)
 
+    best_reward = pre_eval(env, agent, processor, iter=5)
+
     for _ in tqdm.tqdm(range(TRAIN_ITER)):
         reward = run_one_episode(env, agent, processor)
         print("Reward: ", reward)
         if (_ + 1) % 100 == 0:
-            agent.save_model(f"tmp_{SAVE_PATH}")
+            average_reward = pre_eval(env, agent, processor)
+            if average_reward > best_reward:
+                agent.save_model(f"best_{SAVE_PATH}")
+                best_reward = average_reward
             
     agent.save_model(SAVE_PATH)
     
