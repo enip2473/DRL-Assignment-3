@@ -361,7 +361,7 @@ class RainbowDQNAgent:
                  n_actions,            # Number of possible actions
                  device,               # Device to run on ('cpu' or 'cuda')
                  lr=1e-4,              # Learning rate
-                 gamma=0.99,           # Discount factor
+                 gamma=0.69,           # Discount factor
                  buffer_capacity=50000,# Replay buffer capacity
                  batch_size=32,        # Training batch size
                  target_update_freq=1000,# How often to update target network (in steps)
