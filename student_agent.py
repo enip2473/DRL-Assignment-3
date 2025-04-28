@@ -21,6 +21,6 @@ class Agent(object):
             return self.last_action
         processed_state = self.processor.process(observation)
         action = self.agent.select_action(processed_state, use_epsilon=False)
-        self.skip_count = 4
+        self.skip_count = 3
         self.last_action = action
         return action
