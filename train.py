@@ -560,18 +560,23 @@ class RainbowDQNAgent:
         """Decays the exploration rate epsilon."""
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
-    def save_model(self, path):
+    def save_model(self, q_path, target_path):
         """Saves the Q-network weights."""
-        print(f"\nSaving model Q-network state_dict to {path}...")
-        torch.save(self.q_net.state_dict(), path)
+        print(f"\nSaving model Q-network state_dict to {q_path}...")
+        print(f"\nSaving model target-network state_dict to {target_path}...")
+        torch.save(self.q_net.state_dict(), q_path)
+        torch.save(self.target_net.state_dict(), target_path)
         print("Model saved.")
 
-    def load_model(self, path):
+    def load_model(self, q_path, target_path=None):
         """Loads the Q-network weights."""
-        print(f"\nLoading model Q-network state_dict from {path}...")
-        self.q_net.load_state_dict(torch.load(path, map_location=self.device))
-        # Also update target network to match loaded weights
-        self._update_target_network()
+        print(f"\nLoading model Q-network state_dict from {q_path}...")
+        self.q_net.load_state_dict(torch.load(q_path, map_location=self.device))
+        if not target_path:
+            self._update_target_network()
+        else:
+            print(f"\nLoading model target-network state_dict from {target_path}...")
+            self.target_net.load_state_dict(torch.load(target_path, map_location=self.device))
         self.q_net.train() # Ensure model is in train mode after loading
         self.target_net.eval() # Ensure target is in eval mode
         print("Model loaded and target network synchronized.")
@@ -613,7 +618,7 @@ def run_one_episode(env: JoypadSpace, agent: RainbowDQNAgent, processor: MarioPr
     
     return total_reward
 
-def pre_eval(env, agent, processor, iter=10):
+def pre_eval(env, agent, processor, iter=5):
     total_reward = 0
     for _ in range(iter):
         total_reward += run_one_episode(env, agent, processor, is_training=False)
@@ -632,16 +637,19 @@ def main():
         agent.load_model(SAVE_PATH)
 
     best_reward = pre_eval(env, agent, processor, iter=5)
+    rewards_history = []
 
     for _ in tqdm.tqdm(range(TRAIN_ITER)):
         reward = run_one_episode(env, agent, processor)
-        print("Reward: ", reward)
-        if (_ + 1) % 100 == 0:
+        # print("Reward: ", reward)
+        rewards_history.append(reward)
+        if (_ + 1) % 100 == 0 or sum(rewards_history[-5:]) / 5 > max(5500, best_reward):
             average_reward = pre_eval(env, agent, processor)
             if average_reward > best_reward:
-                agent.save_model(f"best_{SAVE_PATH}")
+                agent.save_model(f"best_q_{SAVE_PATH}", f"best_target_{SAVE_PATH}")
                 best_reward = average_reward
-            
+
+
     agent.save_model(SAVE_PATH)
     
 

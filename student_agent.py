@@ -3,14 +3,15 @@ from train import RainbowDQNAgent, MarioPreprocessor
 import torch
 # Do not modify the input of the 'act' function and the '__init__' function. 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SAVE_PATH = "best_model_weight.pth"
+Q_PATH = "best_q_model_weight.pth"
+TARGET_PATH = "best_target_model_weight.pth"
 
 class Agent(object):
     """Agent that acts randomly."""
     def __init__(self):
         self.action_space = gym.spaces.Discrete(12)
         self.agent = RainbowDQNAgent((4, 84, 84), 12, DEVICE)
-        self.agent.load_model(SAVE_PATH)
+        self.agent.load_model(Q_PATH, TARGET_PATH)
         self.processor = MarioPreprocessor()
         self.last_action = None
         self.skip_count = 0
