@@ -649,8 +649,6 @@ def main():
                 agent.save_model(f"best_q_{SAVE_PATH}", f"best_target_{SAVE_PATH}")
                 best_reward = average_reward
 
-
-    agent.save_model(SAVE_PATH)
     
 
 if __name__ == "__main__":
